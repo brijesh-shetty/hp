@@ -13,15 +13,23 @@ logger = logging.getLogger("hpe.db")
 _pool = None
 
 def init_pool():
-    """Create a connection pool (called once at startup)."""
+    """Create a connection pool (called once at startup) with retries."""
     global _pool
     if _pool is None:
-        try:
-            _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, POSTGRES_URL)
-            logger.info("PostgreSQL connection pool initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize PostgreSQL connection pool: {e}")
-            raise
+        import time
+        max_retries = 15
+        retry_delay = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, POSTGRES_URL)
+                logger.info("PostgreSQL connection pool initialized successfully")
+                return
+            except Exception as e:
+                logger.warning(f"PostgreSQL connection attempt {attempt}/{max_retries} failed: {e}")
+                if attempt == max_retries:
+                    logger.error("Failed to initialize PostgreSQL connection pool after all retries")
+                    raise
+                time.sleep(retry_delay)
 
 def get_conn():
     """Get a connection from the pool."""

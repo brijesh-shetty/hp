@@ -5,7 +5,7 @@
 
 import './styles/index.css';
 import { initGlobe, addArc } from './globe.js';
-import { renderPipeline, animatePipelineEvent } from './pipeline.js';
+import { renderPipeline, animatePipelineEvent, updateStageLatencies } from './pipeline.js';
 import { renderDashboard, updateDashboard, updateHealth, updateModelMetrics, showVpnAlert } from './dashboard.js';
 import { initStarField } from './effects.js';
 import { renderAdminDashboard, connectAdminWebSocket } from './admin.js';
@@ -146,13 +146,21 @@ async function processEventQueue() {
 
         const isLivePortal = (prediction.event_summary?.event_source === 'live_portal');
 
-        // Only draw globe arcs and animate pipeline for live logins
-        if (isLivePortal) {
+        // Draw globe arcs and animate pipeline for events
+        // If the queue is growing, skip the slow animations to prevent lagging behind
+        const shouldAnimate = isLivePortal || (eventQueue.length < 3);
+
+        if (shouldAnimate) {
           // Update globe with arc
           addArc(event, prediction);
 
           // Animate pipeline
           await animatePipelineEvent(prediction);
+        } else {
+          // Skip slow animation, just update latencies directly
+          updateStageLatencies(prediction.pipeline_stages);
+          // Add a visual delay to prevent super-fast scrolling of dashboard/logs
+          await sleep(800);
         }
 
         // Always update dashboard (populates threat feeds & logs for both sources)

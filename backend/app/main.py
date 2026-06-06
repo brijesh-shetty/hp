@@ -46,6 +46,14 @@ async def lifespan(app: FastAPI):
         from app import db
         db.init_pool()
         logger.info("[OK] PostgreSQL pool initialized")
+        try:
+            users = db.execute_query("SELECT id, username, department, status, password_hash FROM hpe_users", fetch=True, fetch_all=True)
+            logger.info(f"[DB INSPECTION] Found {len(users)} users in hpe_users:")
+            for u in users:
+                pw_status = "present" if u.get('password_hash') else "NULL"
+                logger.info(f"  - User: {u.get('username')}, Dept: {u.get('department')}, Status: {u.get('status')}, Password: {pw_status}")
+        except Exception as inspect_err:
+            logger.error(f"[DB INSPECTION FAIL] Could not query hpe_users: {inspect_err}")
     except Exception as e:
         logger.error(f"[FAIL] PostgreSQL pool init failed: {e}")
 
@@ -99,6 +107,13 @@ async def lifespan(app: FastAPI):
             logger.warning("[WARN] Vault connection failed — running in fallback mode")
     except Exception as e:
         logger.warning(f"[WARN] Vault unavailable: {e}")
+
+    # ── Load admin JWT signing secret from Vault ──────────────────────────────
+    try:
+        from app import auth_admin
+        auth_admin.load_jwt_secret()
+    except Exception as e:
+        logger.warning(f"[WARN] Admin JWT secret not loaded: {e} — admin auth will use fallback")
 
     # ── Vault infra client (database secrets engine) ───────────────────────────
     try:

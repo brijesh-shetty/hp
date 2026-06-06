@@ -153,8 +153,8 @@ async def simulate_stream(websocket: WebSocket):
             if _sim_index > 0 and _sim_index % total == 0:
                 logger.info(f"Simulation completed cycle {_sim_index // total}, looping...")
 
-            # Random delay between events (500ms - 2s)
-            delay = random.uniform(0.5, 2.0)
+            # Random delay between events (2.0s - 5.0s)
+            delay = random.uniform(2.0, 5.0)
             await asyncio.sleep(delay)
 
     except WebSocketDisconnect:

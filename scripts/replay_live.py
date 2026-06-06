@@ -188,8 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Output file for live replay (default: {LIVE_OUTPUT_FILE})"
     )
     parser.add_argument(
-        "--rate", type=float, default=50.0,
-        help="Events per second (0 = burst/max speed). Default: 50"
+        "--rate", type=float, default=1.0,
+        help="Events per second (0 = burst/max speed). Default: 1"
     )
     parser.add_argument(
         "--repeat", type=int, default=1,

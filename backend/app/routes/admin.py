@@ -2,18 +2,18 @@
 routes/admin.py — Security Admin Dashboard API endpoints.
 Phase 4: CRITICAL_ALERT approval fires user + infrastructure rotation.
 Phase 5: Kafka credential rotation via Vault KV + reconnect on CRITICAL_ALERT.
+Phase 6: JWT-based admin authentication, safer reset (audit + Kafka preserved).
 """
 
 import logging
 import hashlib
-import secrets
 import time
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from pydantic import BaseModel
 from app.schemas import ApprovalRequest, ApprovalResponse
+from app.auth_admin import get_current_admin, create_admin_token, create_reset_token, validate_reset_token, verify_token
 
 from app import admin_store, vault_client, vault_infra_client
-from app.config import ADMIN_SECRET
 from app.ws_manager import admin_manager
 
 class RegistrationApproval(BaseModel):
@@ -21,16 +21,6 @@ class RegistrationApproval(BaseModel):
 
 logger = logging.getLogger("hpe.admin")
 router = APIRouter(prefix="/api/admin", tags=["admin"])
-
-def verify_admin(x_admin_secret: str = Header(default="")):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid admin secret"
-        )
-
-_pending_reset_tokens = {}
-_RESET_TOKEN_TTL = 30
 
 
 def _determine_affected_service(event_data: dict) -> str:
@@ -56,8 +46,33 @@ def _determine_affected_service(event_data: dict) -> str:
         return "elasticsearch"
 
 
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/login")
+async def admin_login(request: AdminLoginRequest):
+    """Exchange admin credentials for a JWT."""
+    from app import db
+    pass_hash = hashlib.sha256(request.password.encode('utf-8')).hexdigest()
+    user = db.execute_query(
+        "SELECT username, password_hash, department FROM hpe_users WHERE username = %s", 
+        (request.username,), fetch=True
+    )
+    
+    if not user or user['password_hash'] != pass_hash:
+        raise HTTPException(401, "Invalid credentials")
+    
+    if user.get('department') != 'Security':
+        raise HTTPException(403, "Admin access requires Security department role")
+    
+    token = create_admin_token(request.username)
+    return {"token": token, "expires_in": 1800, "username": request.username}
+
+
 @router.get("/alerts")
-async def get_alerts(status: str = None, severity: str = None, limit: int = 100):
+async def get_alerts(status: str = None, severity: str = None, limit: int = 100, admin=Depends(get_current_admin)):
     alerts = admin_store.get_all_alerts(status=status, severity=severity, limit=limit)
     pending_count = sum(1 for a in admin_store.get_all_alerts(status="pending"))
     return {
@@ -68,7 +83,7 @@ async def get_alerts(status: str = None, severity: str = None, limit: int = 100)
 
 
 @router.get("/alerts/{alert_id}")
-async def get_alert_detail(alert_id: str):
+async def get_alert_detail(alert_id: str, admin=Depends(get_current_admin)):
     alert = admin_store.get_alert(alert_id)
     if not alert:
         return {"error": f"Alert {alert_id} not found"}
@@ -76,7 +91,7 @@ async def get_alert_detail(alert_id: str):
 
 
 @router.post("/alerts/{alert_id}/approve", response_model=ApprovalResponse)
-async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depends(verify_admin)):
+async def approve_alert(alert_id: str, request: ApprovalRequest, admin=Depends(get_current_admin)):
     """
     Approve credential rotation for a threat alert.
 
@@ -103,6 +118,8 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
             message=f"Alert already resolved as: {alert['status']}",
         )
 
+    admin_username = admin.get('sub', 'unknown')
+
     # ── User-level rotation (all approvals) ───────────────────────────────────
     user_rotation_result = vault_client.rotate_credentials(
         reason=f"admin_approved_{alert['threat_action'].lower()}_score_{alert['threat_score']:.4f}",
@@ -112,7 +129,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
 
     logger.info(
         f"[ADMIN] User credential rotation for {alert['user_id']} "
-        f"(alert={alert_id}, success={user_rotation_result.get('success')}, "
+        f"(alert={alert_id}, admin={admin_username}, success={user_rotation_result.get('success')}, "
         f"action={alert['threat_action']})"
     )
 
@@ -136,7 +153,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
                 ).get("kafka_reconnected", False)
                 logger.warning(
                     f"[ADMIN] Kafka credential rotation completed — "
-                    f"alert={alert_id} "
+                    f"alert={alert_id} admin={admin_username} "
                     f"vault_success={infra_rotation_result.get('success')} "
                     f"kafka_reconnected={kafka_reconnected}"
                 )
@@ -147,7 +164,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
                 logger.warning(
                     f"[ADMIN] Infrastructure credential rotation for "
                     f"service='{affected_service}' "
-                    f"(alert={alert_id}, new_user='{new_user}', "
+                    f"(alert={alert_id}, admin={admin_username}, new_user='{new_user}', "
                     f"success={infra_rotation_result.get('success')})"
                 )
         else:
@@ -161,7 +178,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
             }
     else:
         logger.info(
-            f"[ADMIN] BLOCK threat approved — user rotation only "
+            f"[ADMIN] BLOCK threat approved by {admin_username} — user rotation only "
             f"(score={alert['threat_score']:.4f} < 0.85 CRITICAL threshold)"
         )
 
@@ -221,7 +238,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest,_: None = Depend
 
 
 @router.post("/alerts/{alert_id}/reject", response_model=ApprovalResponse)
-async def reject_alert(alert_id: str, request: ApprovalRequest,_: None = Depends(verify_admin)):
+async def reject_alert(alert_id: str, request: ApprovalRequest, admin=Depends(get_current_admin)):
     alert = admin_store.reject_alert(alert_id, admin_notes=request.admin_notes)
     if not alert:
         return ApprovalResponse(
@@ -230,6 +247,9 @@ async def reject_alert(alert_id: str, request: ApprovalRequest,_: None = Depends
             action="reject",
             message=f"Alert {alert_id} not found",
         )
+
+    admin_username = admin.get('sub', 'unknown')
+    logger.info(f"[ADMIN] Alert {alert_id} rejected by {admin_username}")
 
     await admin_manager.broadcast({
         "type": "alert_resolved",
@@ -249,7 +269,7 @@ async def reject_alert(alert_id: str, request: ApprovalRequest,_: None = Depends
 
 
 @router.get("/stats")
-async def get_admin_stats():
+async def get_admin_stats(admin=Depends(get_current_admin)):
     stats = admin_store.get_stats()
     stats["infra_rotation_count"] = vault_infra_client.get_infra_rotation_count()
     stats["active_infra_leases"] = vault_infra_client.get_active_leases()
@@ -257,13 +277,13 @@ async def get_admin_stats():
 
 
 @router.get("/audit-log")
-async def get_audit_log(limit: int = 50):
+async def get_audit_log(limit: int = 50, admin=Depends(get_current_admin)):
     log = admin_store.get_audit_log(limit=limit)
     return {"total": len(log), "entries": log}
 
 
 @router.get("/infra-leases")
-async def get_infra_leases():
+async def get_infra_leases(admin=Depends(get_current_admin)):
     """
     Get all active infrastructure leases including Kafka Vault KV status.
     Phase 5: Kafka section shows vault_managed_credential metadata.
@@ -276,7 +296,7 @@ async def get_infra_leases():
 
 
 @router.get("/registrations")
-async def get_registrations():
+async def get_registrations(admin=Depends(get_current_admin)):
     """Fetch all users currently in 'pending' status."""
     from app import db
     query = "SELECT username, department, status FROM hpe_users WHERE status = 'pending'"
@@ -292,16 +312,17 @@ async def get_registrations():
 
 
 @router.post("/registrations/{username}/approve")
-async def approve_registration(username: str, approval: RegistrationApproval):
+async def approve_registration(username: str, approval: RegistrationApproval, admin=Depends(get_current_admin)):
     """Approve a pending user registration and set their password."""
     from app import db
+    admin_username = admin.get('sub', 'unknown')
     pass_hash = hashlib.sha256(approval.password.encode('utf-8')).hexdigest()
     try:
         db.execute_query(
             "UPDATE hpe_users SET status = 'active', password_hash = %s WHERE username = %s", 
             (pass_hash, username)
         )
-        logger.info(f"[ADMIN] Registration approved and credentials issued for user: {username}")
+        logger.info(f"[ADMIN] Registration approved by {admin_username} — credentials issued for user: {username}")
         return {"success": True, "message": f"User {username} approved and credentials issued."}
     except Exception as e:
         logger.error(f"Failed to approve registration for {username}: {e}")
@@ -310,67 +331,57 @@ async def approve_registration(username: str, approval: RegistrationApproval):
 
 
 @router.post("/registrations/{username}/reject")
-async def reject_registration(username: str):
+async def reject_registration(username: str, admin=Depends(get_current_admin)):
     """Reject and delete a pending user registration."""
     from app import db
+    admin_username = admin.get('sub', 'unknown')
     try:
         db.execute_query("DELETE FROM hpe_users WHERE username = %s AND status = 'pending'", (username,))
-        logger.info(f"[ADMIN] Registration rejected/deleted for user: {username}")
+        logger.info(f"[ADMIN] Registration rejected by {admin_username} for user: {username}")
         return {"success": True, "message": f"Registration for {username} rejected."}
     except Exception as e:
         logger.error(f"Failed to reject registration for {username}: {e}")
         return {"success": False, "message": str(e)}
 
 
-class ResetRequest(BaseModel):
-    confirm_token: str = ""
-
-
 @router.post("/reset/request")
-async def request_reset_token(_: None = Depends(verify_admin)):
-    """Issue a short-lived token required to confirm a reset."""
-
-    token = secrets.token_hex(16)
-
-    _pending_reset_tokens[token] = (
-        time.time() + _RESET_TOKEN_TTL
-    )
-
-    logger.warning(
-        "[RESET] Reset token issued — expires in 30s"
-    )
-
+async def request_reset(admin=Depends(get_current_admin)):
+    """Step 1: Generate a one-time reset token (valid 60s)."""
+    token = create_reset_token()
+    logger.warning(f"[ADMIN] Reset requested by {admin.get('sub', 'unknown')} — confirmation token issued (60s TTL)")
     return {
         "confirm_token": token,
-        "expires_in_seconds": _RESET_TOKEN_TTL,
+        "expires_in": 60,
+        "message": "Send this token to POST /api/admin/reset/confirm within 60 seconds."
     }
-@router.post("/reset")
-async def reset_pipeline(request: ResetRequest,_: None = Depends(verify_admin)):
-    """Wipe all pipeline state and start fresh."""
-    # Validate token
-    token = request.confirm_token
-    expiry = _pending_reset_tokens.get(token)
-    if not expiry or time.time() > expiry:
-        logger.warning("[RESET] Rejected — missing or expired confirm_token")
-        return {"success": False, "message": "Valid confirm_token required. Call /api/admin/reset/request first."}
+
+class ResetConfirmRequest(BaseModel):
+    confirm_token: str
+
+@router.post("/reset/confirm")
+async def confirm_reset(request: ResetConfirmRequest, admin=Depends(get_current_admin)):
+    """Step 2: Execute reset only if token is valid and not expired."""
+    if not validate_reset_token(request.confirm_token):
+        raise HTTPException(400, "Invalid or expired reset token. Request a new one.")
     
-    # Consume the token (one-time use)
-    del _pending_reset_tokens[token]
+    admin_username = admin.get('sub', 'unknown')
 
     try:
         from app import db, elastic_client, kafka_client
 
-        # 1. Truncate all hpe_* Postgres tables and reset stats
-        logger.warning("[FRESH RESTART] Wiping PostgreSQL state")
+        # 1. Truncate all hpe_* Postgres tables EXCEPT audit log — and reset stats
+        logger.warning(f"[FRESH RESTART] Wiping PostgreSQL state. Initiated by admin: {admin_username}")
         db.execute_query("TRUNCATE TABLE hpe_admin_alerts, hpe_infra_leases, hpe_credential_rotations CASCADE")
-        # Audit log is intentionally preserved
+        # Audit log is intentionally preserved (append-only)
         logger.warning("[RESET] Pipeline state cleared. Audit log preserved (append-only).")
-        
+
+        # Record the reset action in the audit log
         from datetime import datetime, timezone
         db.execute_query(
             "INSERT INTO hpe_admin_audit_log (action, alert_id, user_id, admin_notes) VALUES (%s, %s, %s, %s)",
-            ("pipeline_reset", "SYSTEM", "admin", f"Pipeline reset performed at {datetime.now(timezone.utc).isoformat()}")
+            ("pipeline_reset", "SYSTEM", admin_username, f"Pipeline reset performed at {datetime.now(timezone.utc).isoformat()}")
         )
+
         db.execute_query("UPDATE hpe_admin_stats SET total_alerts_created=0, total_approved=0, total_rejected=0, total_auto_allowed=0 WHERE id=1")
         db.execute_query("UPDATE hpe_pipeline_metrics SET total_requests=0, total_threats=0, total_allowed=0, total_monitored=0, total_blocked=0, total_critical=0, total_latency_ms=0, attack_types='{}' WHERE id=1")
         db.execute_query("UPDATE hpe_simulation_state SET sim_index=0 WHERE id=1")
@@ -387,15 +398,15 @@ async def reset_pipeline(request: ResetRequest,_: None = Depends(verify_admin)):
         simulate_route._sim_index = 0
         simulate_route._sim_batch_count = 0
 
-        # 3. Delete Kafka topics
-        logger.warning("[FRESH RESTART] Wiping Kafka topics")
-        if kafka_client.is_connected() and kafka_client._admin:
+        # 3. Flush Kafka producers (preserve topics + consumer offsets)
+        logger.warning("[FRESH RESTART] Flushing Kafka producers (topics preserved)")
+        if kafka_client.is_connected():
             try:
-                from app.config import KAFKA_RAW_EVENTS_TOPIC, KAFKA_ALERTS_TOPIC, KAFKA_AUDIT_TOPIC
-                kafka_client._admin.delete_topics([KAFKA_RAW_EVENTS_TOPIC, KAFKA_ALERTS_TOPIC, KAFKA_AUDIT_TOPIC])
-                time.sleep(2)  # Give Kafka time to delete
+                if hasattr(kafka_client, '_producer') and kafka_client._producer:
+                    kafka_client._producer.flush(timeout=5)
+                    logger.info("[RESET] Kafka producer flushed successfully")
             except Exception as e:
-                logger.error(f"Kafka topic deletion error: {e}")
+                logger.error(f"Kafka flush error: {e}")
         
         # 4. Delete ES indices
         logger.warning("[FRESH RESTART] Wiping Elasticsearch indices")
@@ -407,14 +418,26 @@ async def reset_pipeline(request: ResetRequest,_: None = Depends(verify_admin)):
             except Exception as e:
                 logger.error(f"ES index deletion error: {e}")
 
-        return {"success": True, "message": "Pipeline reset complete"}
+        logger.warning(f"[ADMIN] Pipeline reset EXECUTED by {admin_username}")
+        return {"success": True, "message": "Pipeline reset complete. Audit log and Kafka topics preserved."}
     except Exception as e:
         logger.error(f"[FRESH RESTART] Failed: {e}")
         return {"success": False, "message": str(e)}
 
 
 @router.websocket("/ws")
-async def admin_websocket(websocket: WebSocket):
+async def admin_websocket(websocket: WebSocket, token: str = None):
+    if not token:
+        await websocket.accept()
+        await websocket.close(code=4001, reason="Missing token")
+        return
+    try:
+        verify_token(token)
+    except Exception:
+        await websocket.accept()
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+
     await websocket.accept()
     admin_manager.add(websocket)
 

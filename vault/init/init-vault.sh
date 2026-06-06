@@ -244,6 +244,17 @@ VAULT_ROLE_ID=$ROLE_ID
 VAULT_SECRET_ID=$SECRET_ID
 CREDS
 
+# ── Phase 6: JWT Admin Auth Secret ─────────────────────────────────────────
+echo ">>> Seeding JWT signing secret into Vault KV..."
+# Generate random 32-byte hex string
+JWT_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+wget -qO- \
+  --header="Content-Type: application/json" \
+  --header="X-Vault-Token: $ROOT_TOKEN" \
+  --post-data="{\"data\":{\"signing_key\":\"$JWT_SECRET\",\"algorithm\":\"HS256\",\"token_ttl_minutes\":30}}" \
+  "$VAULT_ADDR/v1/secret/data/hpe/admin-jwt" > /dev/null
+echo ">>> JWT signing secret stored at secret/data/hpe/admin-jwt"
+
 echo ""
 echo "=========================================="
 echo "  Vault fully ready! (Phase 1+2+3)"

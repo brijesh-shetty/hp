@@ -2383,3 +2383,97 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.7; }
 }
+
+/* ── Admin Login Overlay Styles ─────────────────────────────────────────── */
+.admin-login-overlay {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 500px;
+  padding: var(--space-xl);
+}
+
+.admin-login-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-xl) var(--space-2xl);
+  max-width: 420px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(20px);
+  transition: border-color 0.3s ease;
+}
+
+.admin-login-card:hover {
+  border-color: var(--panel-border-hover);
+}
+
+.admin-login-icon {
+  font-size: 40px;
+  margin-bottom: var(--space-md);
+  filter: drop-shadow(0 0 10px rgba(34, 211, 238, 0.3));
+}
+
+.admin-login-card h3 {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: var(--space-xs);
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+
+.admin-login-card input {
+  width: 100%;
+  padding: 12px 16px;
+  margin: var(--space-sm) 0;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.admin-login-card input:focus {
+  outline: none;
+  border-color: var(--cyan);
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.15);
+}
+
+.admin-login-card button {
+  width: 100%;
+  padding: 12px;
+  margin-top: var(--space-md);
+  background: var(--cyan);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 15px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.admin-login-card button:hover:not(:disabled) {
+  background: #22d3eecc;
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.3);
+  transform: translateY(-1px);
+}
+
+.admin-login-card button:disabled {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.admin-login-error {
+  color: var(--magenta);
+  font-size: 12px;
+  margin-top: var(--space-md);
+  font-family: var(--font-mono);
+  min-height: 18px;
+}

@@ -202,7 +202,6 @@ services:
       - TEST_EVENTS_PATH=/app/model_output/test_events.json
       - PROFILES_PATH=/app/model_output/user_profiles.json
       - ZEEK_LOG_PATH=/app/dataset/zeek-live/conn.log
-      - ADMIN_SECRET=${ADMIN_SECRET:-hpe-admin-secret-change-me}
       # VAULT_TOKEN is intentionally removed in Phase 3.
 
       # The backend reads role_id + secret_id from /vault/data/.approle_credentials
@@ -267,7 +266,7 @@ services:
       python scripts/replay_live.py
         --source /repo/dataset/zeek/conn.log
         --output /repo/dataset/zeek-live/conn.log
-        --rate ${REPLAY_RATE:-50}
+        --rate ${REPLAY_RATE:-1}
         --loop
     depends_on:
       - elasticsearch

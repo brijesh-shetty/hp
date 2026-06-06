@@ -8,15 +8,195 @@ let alerts = [];
 let auditLog = [];
 let adminStats = {};
 let selectedAlertId = null;
+let activeContainerId = 'admin-content';
+let adminToken = sessionStorage.getItem('admin_jwt') || null;
+let adminUser = sessionStorage.getItem('admin_user') || 'admin';
+
+function getAuthHeaders() {
+  return adminToken 
+    ? { 'Authorization': `Bearer ${adminToken}`, 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json' };
+}
+
+function isAdminLoggedIn() {
+  if (!adminToken) return false;
+  try {
+    const payload = JSON.parse(atob(adminToken.split('.')[1]));
+    return payload.exp * 1000 > Date.now();
+  } catch (e) {
+    return false;
+  }
+}
+
+async function adminFetch(url, options = {}) {
+  options.headers = {
+    ...options.headers,
+    ...getAuthHeaders()
+  };
+  try {
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      console.warn('[ADMIN] Unauthorized request (401), logging out...');
+      logoutAdmin();
+      return null;
+    }
+    return res;
+  } catch (e) {
+    console.error(`[ADMIN] Fetch error for ${url}:`, e);
+    throw e;
+  }
+}
+
+function logoutAdmin() {
+  adminToken = null;
+  adminUser = 'admin';
+  sessionStorage.removeItem('admin_jwt');
+  sessionStorage.removeItem('admin_user');
+  if (adminWs) {
+    try { adminWs.close(); } catch (e) {}
+    adminWs = null;
+  }
+  renderAdminDashboard(activeContainerId);
+}
+
+window._logoutAdmin = function() {
+  logoutAdmin();
+};
+
+async function handleAdminLogin() {
+  const userEl = document.getElementById('admin-login-user');
+  const passEl = document.getElementById('admin-login-pass');
+  const errorEl = document.getElementById('admin-login-error');
+  const btnEl = document.getElementById('admin-login-btn');
+  
+  if (!userEl || !passEl) return;
+  const username = userEl.value.trim();
+  const password = passEl.value;
+  
+  if (!username || !password) {
+    if (errorEl) errorEl.textContent = 'Please enter both username and password.';
+    return;
+  }
+  
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Authenticating...';
+  }
+  if (errorEl) errorEl.textContent = '';
+
+  try {
+    const res = await fetch('/api/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    
+    if (res.status === 401) {
+      if (errorEl) errorEl.textContent = 'Invalid credentials.';
+    } else if (res.status === 403) {
+      const data = await res.json();
+      if (errorEl) errorEl.textContent = data.detail || 'Security department role required.';
+    } else if (!res.ok) {
+      if (errorEl) errorEl.textContent = 'Authentication failed. Please try again.';
+    } else {
+      const data = await res.json();
+      adminToken = data.token;
+      adminUser = data.username || username;
+      sessionStorage.setItem('admin_jwt', adminToken);
+      sessionStorage.setItem('admin_user', adminUser);
+      renderAdminDashboard(activeContainerId);
+      connectAdminWebSocket();
+    }
+  } catch (e) {
+    if (errorEl) errorEl.textContent = 'Network error. Please try again later.';
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Authenticate';
+    }
+  }
+}
+
+window._requestReset = async function() {
+  if (!confirm("⚠️ WARNING: This will wipe alerts, infra leases, credential rotations, and Elasticsearch indices.\n\nAudit logs and Kafka topics will be preserved.\n\nAre you sure you want to request a pipeline reset?")) {
+    return;
+  }
+
+  try {
+    const res = await adminFetch('/api/admin/reset/request', { method: 'POST' });
+    if (!res || !res.ok) {
+      showToast('❌ Reset Failed', 'Could not request a reset token.');
+      return;
+    }
+    const data = await res.json();
+    const token = data.confirm_token;
+    
+    const secondConfirmation = confirm(
+      `⚠️ CRITICAL CONFIRMATION REQUIRED.\n\n` +
+      `A one-time reset token has been issued (Expires in 60s).\n` +
+      `Click OK to execute the pipeline reset now, or Cancel to abort.`
+    );
+    
+    if (secondConfirmation) {
+      const confirmRes = await adminFetch('/api/admin/reset/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ confirm_token: token })
+      });
+      if (confirmRes && confirmRes.ok) {
+        showToast('🔥 Pipeline Reset Complete', 'All data wiped successfully.');
+        loadAlerts();
+        loadAdminStats();
+        loadAuditLog();
+        loadRegistrations();
+      } else {
+        const errData = confirmRes ? await confirmRes.json() : {};
+        showToast('❌ Reset Failed', errData.detail || 'Confirmation failed or expired.');
+      }
+    }
+  } catch (e) {
+    showToast('❌ Reset Error', 'An error occurred during reset.');
+  }
+};
 
 /**
  * Render the Admin Dashboard layout
  */
 export function renderAdminDashboard(containerId) {
+  activeContainerId = containerId;
   const container = document.getElementById(containerId);
   if (!container) return;
 
+  if (!isAdminLoggedIn()) {
+    container.innerHTML = `
+      <div class="admin-login-overlay">
+        <div class="admin-login-card">
+          <div class="admin-login-icon">🔒</div>
+          <h3>Admin Authentication Required</h3>
+          <p style="color: var(--text-secondary); margin-bottom: 24px;">Enter Security department credentials to access the admin console.</p>
+          <input type="text" id="admin-login-user" placeholder="Username" style="width: 100%; box-sizing: border-box;" />
+          <input type="password" id="admin-login-pass" placeholder="Password" style="width: 100%; box-sizing: border-box;" />
+          <button id="admin-login-btn">Authenticate</button>
+          <div id="admin-login-error" class="admin-login-error"></div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('admin-login-btn')?.addEventListener('click', handleAdminLogin);
+    const enterHandler = (e) => { if (e.key === 'Enter') handleAdminLogin(); };
+    document.getElementById('admin-login-user')?.addEventListener('keyup', enterHandler);
+    document.getElementById('admin-login-pass')?.addEventListener('keyup', enterHandler);
+    return;
+  }
+
   container.innerHTML = `
+    <!-- Admin Console Header with Logout -->
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid var(--glass-border);">
+      <div style="color: var(--text-muted); font-size: 13px; font-family: var(--font-mono);">
+        Logged in as: <strong style="color: var(--cyan);">${adminUser}</strong>
+      </div>
+      <button class="admin-btn-action reject" style="background: rgba(255,255,255,0.05); border: 1px solid var(--glass-border); color: var(--text-primary); padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 12px;" onclick="window._logoutAdmin()">Sign Out</button>
+    </div>
+
     <!-- Admin Stats Row -->
     <div class="admin-stats-row">
       <div class="admin-stat-card critical-glow">
@@ -143,6 +323,20 @@ export function renderAdminDashboard(containerId) {
       </div>
       <button class="admin-toast-close" id="admin-toast-close">×</button>
     </div>
+
+    <!-- Danger Zone -->
+    <div class="admin-audit-section danger-zone-section" style="border: 1px solid var(--magenta); margin-top: 32px; background: rgba(255, 0, 92, 0.05); border-radius: 12px; padding: 24px;">
+      <div class="admin-panel-header" style="border-bottom: 1px solid rgba(255, 0, 92, 0.2); padding-bottom: 12px; margin-bottom: 16px;">
+        <span class="admin-panel-title" style="color: var(--magenta); font-weight: bold;">⚠️ Danger Zone</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <h4 style="margin: 0 0 8px 0; color: var(--text-primary);">Reset Pipeline State</h4>
+          <p style="margin: 0; color: var(--text-muted); font-size: 13px;">Wipe all Postgres database records, Kafka topics, and Elasticsearch indices to start fresh.</p>
+        </div>
+        <button class="admin-btn-action reject" style="background: var(--magenta); color: #fff; padding: 12px 24px; font-weight: bold; border-radius: 8px; border: none; cursor: pointer;" onclick="window._requestReset()">Reset Pipeline</button>
+      </div>
+    </div>
   `;
 
   // Setup filter listeners
@@ -170,8 +364,8 @@ export function renderAdminDashboard(containerId) {
  */
 async function loadRegistrations() {
   try {
-    const res = await fetch('/api/admin/registrations');
-    if (!res.ok) return;
+    const res = await adminFetch('/api/admin/registrations');
+    if (!res || !res.ok) return;
     const data = await res.json();
     const registrations = data.registrations || [];
 
@@ -212,11 +406,11 @@ window._approveReg = async function (username) {
   if (!password) return;
 
   try {
-    const res = await fetch(`/api/admin/registrations/${username}/approve`, {
+    const res = await adminFetch(`/api/admin/registrations/${username}/approve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: password })
     });
+    if (!res) return;
     const data = await res.json();
     if (data.success) {
       showToast('✅ User Approved', `${username} is now active with the provided credentials.`);
@@ -234,7 +428,8 @@ window._approveReg = async function (username) {
 window._rejectReg = async function (username) {
   if (!confirm(`Are you sure you want to reject registration for ${username}?`)) return;
   try {
-    const res = await fetch(`/api/admin/registrations/${username}/reject`, { method: 'POST' });
+    const res = await adminFetch(`/api/admin/registrations/${username}/reject`, { method: 'POST' });
+    if (!res) return;
     const data = await res.json();
     if (data.success) {
       showToast('❌ User Rejected', `Registration for ${username} deleted.`);
@@ -251,8 +446,12 @@ window._rejectReg = async function (username) {
  * Connect admin WebSocket for real-time notifications
  */
 export function connectAdminWebSocket() {
+  if (!isAdminLoggedIn()) {
+    console.log('[ADMIN] WebSocket connection deferred: admin not logged in');
+    return;
+  }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/api/admin/ws`;
+  const wsUrl = `${protocol}//${window.location.host}/api/admin/ws?token=${adminToken}`;
 
   try {
     adminWs = new WebSocket(wsUrl);
@@ -272,7 +471,9 @@ export function connectAdminWebSocket() {
 
     adminWs.onclose = () => {
       console.log('[ADMIN] WebSocket disconnected');
-      setTimeout(connectAdminWebSocket, 5000);
+      if (isAdminLoggedIn()) {
+        setTimeout(connectAdminWebSocket, 5000);
+      }
     };
 
     adminWs.onerror = () => {
@@ -335,8 +536,8 @@ async function loadAlerts() {
     if (statusFilter) url += `&status=${statusFilter}`;
     if (severityFilter) url += `&severity=${severityFilter}`;
 
-    const res = await fetch(url);
-    if (!res.ok) return;
+    const res = await adminFetch(url);
+    if (!res || !res.ok) return;
     const data = await res.json();
     alerts = data.alerts || [];
     renderAlertList();
@@ -423,8 +624,8 @@ window._selectAdminAlert = async function (alertId) {
   detail.innerHTML = '<div class="admin-loading">Loading forensic data...</div>';
 
   try {
-    const res = await fetch(`/api/admin/alerts/${alertId}`);
-    if (!res.ok) throw new Error('Failed to load');
+    const res = await adminFetch(`/api/admin/alerts/${alertId}`);
+    if (!res || !res.ok) throw new Error('Failed to load');
     const alert = await res.json();
     renderAlertDetail(alert);
   } catch (e) {
@@ -608,11 +809,11 @@ window._approveAlert = async function (alertId) {
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Rotating credentials...'; }
 
   try {
-    const res = await fetch(`/api/admin/alerts/${alertId}/approve`, {
+    const res = await adminFetch(`/api/admin/alerts/${alertId}/approve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ admin_notes: notes }),
     });
+    if (!res) return;
     const data = await res.json();
 
     if (data.success) {
@@ -640,11 +841,11 @@ window._rejectAlert = async function (alertId) {
   const notes = document.getElementById('admin-notes-input')?.value || '';
 
   try {
-    const res = await fetch(`/api/admin/alerts/${alertId}/reject`, {
+    const res = await adminFetch(`/api/admin/alerts/${alertId}/reject`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ admin_notes: notes }),
     });
+    if (!res) return;
     const data = await res.json();
 
     if (data.success) {
@@ -666,8 +867,8 @@ window._rejectAlert = async function (alertId) {
  */
 async function loadAdminStats() {
   try {
-    const res = await fetch('/api/admin/stats');
-    if (!res.ok) return;
+    const res = await adminFetch('/api/admin/stats');
+    if (!res || !res.ok) return;
     adminStats = await res.json();
 
     updateEl('admin-pending-count', adminStats.pending_count || 0);
@@ -690,8 +891,8 @@ async function loadAdminStats() {
  */
 async function loadAuditLog() {
   try {
-    const res = await fetch('/api/admin/audit-log?limit=50');
-    if (!res.ok) return;
+    const res = await adminFetch('/api/admin/audit-log?limit=50');
+    if (!res || !res.ok) return;
     const data = await res.json();
     auditLog = data.entries || [];
 

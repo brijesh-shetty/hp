@@ -31,8 +31,19 @@ The admin dashboard provides:
 * **Real-time Alert Queue** — Critical and high-severity threats appear as pending alerts
 * **Forensic Detail View** — Full event facts, model scores (XGBoost, LightGBM, Ensemble), geo data, and all 10 pipeline stage results
 * **Approve / Reject Workflow** — One-click credential rotation approval or false positive rejection
-* **Audit Log** — Complete history of all admin actions with timestamps and notes
+* **Audit Log** — Complete, append-only history of all admin actions with timestamps, admin attribution, and notes
 * **WebSocket Notifications** — Instant toast alerts when new critical threats are detected
+* **User Registration Management** — Approve or reject pending user access requests from the public login portal
+* **Pipeline Reset (Danger Zone)** — Two-step confirmed reset with one-time token (60s TTL); preserves audit log and Kafka topics
+
+### Admin Authentication & Security
+
+The admin console is protected by **JWT-based authentication** with short-lived tokens (30-minute TTL). The JWT signing key is stored in HashiCorp Vault (`hpe/admin-jwt`), ensuring the signing secret is never hardcoded or exposed in environment variables.
+
+* **JWT Auth** — Admins authenticate with Security department credentials; all subsequent API requests carry a `Bearer` token validated via `Depends(get_current_admin)`.
+* **Admin Attribution** — Every admin action (approve, reject, reset, registration approval/rejection) is logged with the admin's username for full traceability and non-repudiation.
+* **Append-Only Audit Trail** — The `hpe_admin_audit_log` table is never truncated, even during pipeline resets. Reset actions are explicitly recorded in the audit log with the admin's identity and timestamp.
+* **Safer Pipeline Reset** — Resets wipe derived state (alerts, metrics, leases) but **preserve** the audit log and Kafka topics (topics are flushed, not deleted, preserving event history and consumer offsets).
 
 ## Technologies Used
 * **Frontend:** Vanilla JavaScript, Vite, HTML5, CSS3 (Structural Cyber-Bento styling).
@@ -440,16 +451,22 @@ Navigate to **http://localhost:5173**. The application will automatically use "L
 
 ### Admin API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/admin/alerts` | List all alerts (filter: `?status=pending&severity=critical`) |
-| GET | `/api/admin/alerts/{id}` | Full forensic detail for an alert |
-| POST | `/api/admin/alerts/{id}/approve` | Approve credential rotation |
-| POST | `/api/admin/alerts/{id}/reject` | Reject as false positive |
-| GET | `/api/admin/stats` | Dashboard summary statistics |
-| GET | `/api/admin/audit-log` | History of admin actions |
-| GET | `/api/admin/infra-leases` | Active Vault infrastructure leases and Kafka credential status |
-| WS | `/api/admin/ws` | Real-time alert notifications |
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/api/admin/login` | None | Exchange Security department credentials for a JWT |
+| GET | `/api/admin/alerts` | JWT | List all alerts (filter: `?status=pending&severity=critical`) |
+| GET | `/api/admin/alerts/{id}` | JWT | Full forensic detail for an alert |
+| POST | `/api/admin/alerts/{id}/approve` | JWT | Approve credential rotation (logs admin attribution) |
+| POST | `/api/admin/alerts/{id}/reject` | JWT | Reject as false positive (logs admin attribution) |
+| GET | `/api/admin/stats` | JWT | Dashboard summary statistics |
+| GET | `/api/admin/audit-log` | JWT | History of admin actions |
+| GET | `/api/admin/infra-leases` | JWT | Active Vault infrastructure leases and Kafka credential status |
+| GET | `/api/admin/registrations` | JWT | List pending user access requests |
+| POST | `/api/admin/registrations/{user}/approve` | JWT | Approve a pending user and set credentials |
+| POST | `/api/admin/registrations/{user}/reject` | JWT | Reject and delete a pending registration |
+| POST | `/api/admin/reset/request` | JWT | Generate a one-time pipeline reset token (60s TTL) |
+| POST | `/api/admin/reset/confirm` | JWT | Execute pipeline reset with a valid confirmation token |
+| WS | `/api/admin/ws` | JWT (query param) | Real-time alert notifications |
 
 ---
 
